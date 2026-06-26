@@ -1,0 +1,8 @@
+.DS_Store
+
+data/raw/player_game_stats_*.csv
+data/raw/players.csv
+
+*_cache/
+*_files/
+pres_cache/

@@ -1,0 +1,90 @@
+slides > slide {
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  color: #000000;
+}
+
+slides > slide article,
+slides > slide p,
+slides > slide li,
+slides > slide td,
+slides > slide th {
+  color: #000000;
+  font-size: 22px;
+  line-height: 1.5;
+}
+
+slides > slide article.smaller p,
+slides > slide article.smaller ul,
+slides > slide article.smaller ol,
+slides > slide article.smaller li{
+  font-size: 22px;
+  line-height: 1.5;
+}
+
+slides > slide.title-slide hgroup h1 {
+  font-size: 62px;
+  color: #000000;
+}
+
+slides > slide.title-slide hgroup h2 {
+  font-size: 30px;
+  color: #222222;
+}
+
+slides > slide:not(.title-slide) h2 {
+  font-size: 34px;
+  color: #000000;
+  border-bottom: 2px solid #000000;
+  padding-bottom: 6px;
+}
+
+slides > slide.segue h2,
+slides > slide.segue hgroup h2,
+slides > slide.segue p,
+slides > slide.segue h3 {
+  color: #000000 !important;
+}
+
+slides > slide {
+  background-image: linear-gradient(rgba(255,255,255,0.82), rgba(255,255,255,0.85)),
+                    url('nba9.jpg');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  overflow-y: auto !important;
+}
+
+slides > slide table tr,
+slides > slide table td,
+slides > slide table th,
+slides > slide table tr:nth-child(even) td,
+slides > slide table tr:nth-child(odd) td {
+  background-color: transparent !important;
+}
+
+slides > slide table.rmdtable th {
+  background-color: #a84646 !important;
+  background-image: linear-gradient(to bottom, #b1394f, #961f23) !important;
+  color: #ffffff !important;
+}
+
+slides > slide table.rmdtable td,
+slides > slide table.rmdtable th {
+  font-size: 20px !important;
+}
+
+blockquote {
+  border-left: 4px solid #1D428A;
+  padding-left: 12px;
+  color: #333;
+  font-style: italic;
+}
+
+strong {
+  color: #C8102E;
+}
+
+slides > slide:not(.nobackground):after {
+  content: '' !important;
+}

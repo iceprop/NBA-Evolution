@@ -1,0 +1,619 @@
+---
+title: "Evoluzione NBA"
+subtitle: "Una prospettiva di analisi delle reti"
+author: "Advanced Data Science — Università di Udine"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    transition: faster
+    css: presentation.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      cache = TRUE, cache.path = "pres_cache/")
+```
+
+```{r packages, cache=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(igraph)
+  library(ggraph)
+  library(tidygraph)
+  library(patchwork)
+  library(knitr)
+  library(ineq)
+})
+```
+
+```{r helpers, cache=FALSE}
+SEASONS <- c("2004-05", "2005-06", "2006-07", "2007-08", "2008-09", "2009-10",
+             "2010-11", "2011-12", "2012-13", "2013-14", "2014-15", "2015-16",
+             "2016-17", "2017-18", "2018-19", "2019-20", "2020-21", "2021-22",
+             "2022-23", "2023-24", "2024-25")
+FOCUS <- c("2004-05", "2014-15", "2024-25")
+EAST_ABBR <- c("ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA",
+               "MIL", "NYK", "ORL", "PHI", "TOR", "WAS")
+WEST_ABBR <- c("DAL", "DEN", "GSW", "HOU", "LAC", "LAL", "MEM", "MIN", "NOP",
+               "OKC", "PHX", "POR", "SAC", "SAS", "UTA")
+CONF_COL <- c(East = "#1D428A", West = "#C8102E")
+
+normalize_tid <- function(x) {
+  as.integer(suppressWarnings(as.numeric(as.character(x))))
+}
+
+filter_games <- function(df, nba_ids) {
+  df %>%
+    filter(str_starts(SEASON_ID, "2"),
+           normalize_tid(TEAM_ID) %in% nba_ids,
+           WL %in% c("W","L"))
+}
+filter_tgs <- function(df, nba_ids) {
+  df %>%
+    filter(str_starts(GAME_ID, "002"),
+           normalize_tid(TEAM_ID) %in% nba_ids)
+}
+
+style_features <- function(tgs_filt, teams_df) {
+  tgs_filt %>%
+    mutate(tid = normalize_tid(TEAM_ID)) %>%
+    group_by(tid) %>%
+    summarize(
+      pts = mean(PTS, na.rm = TRUE),
+      fg3a = mean(FG3A, na.rm = TRUE),
+      fg3p = mean(FG3_PCT, na.rm = TRUE),
+      ast = mean(AST, na.rm = TRUE),
+      tov = mean(TO, na.rm = TRUE),
+      oreb = mean(OREB, na.rm = TRUE),
+      dreb = mean(DREB, na.rm = TRUE),
+      blk = mean(BLK, na.rm = TRUE),
+      stl = mean(STL, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(teams_df %>% mutate(id = as.integer(id)) %>%
+              select(id, abbreviation),
+              by = c("tid" = "id"))
+}
+
+cosine_sim_mat <- function(sf, feat_center = NULL, feat_scale = NULL) {
+  feat <- sf %>% select(pts, fg3a, fg3p, ast, tov, oreb, dreb, blk, stl) %>% as.matrix()
+  rownames(feat) <- sf$abbreviation
+  feat <- feat[complete.cases(feat), ]
+  fs <- scale(feat, center = feat_center, scale = feat_scale)
+  nrm <- sqrt(rowSums(fs^2))
+  fn <- fs / nrm
+  fn %*% t(fn)
+}
+
+build_style_graph <- function(sim_mat) {
+  adj <- sim_mat
+  adj[is.na(adj) | adj < 0.45] <- 0
+  g <- graph_from_adjacency_matrix(adj, mode = "upper", weighted = TRUE, diag = FALSE)
+  set_vertex_attr(g, "conference",
+                  value = ifelse(V(g)$name %in% EAST_ABBR, "East", "West"))
+}
+
+build_competition <- function(games_filt, teams_df) {
+  results <- games_filt %>%
+    mutate(tid = normalize_tid(TEAM_ID)) %>%
+    select(GAME_ID, tid, WL) %>%
+    pivot_wider(names_from = WL, values_from = tid) %>%
+    filter(!is.na(W), !is.na(L)) %>%
+    rename(winner = W, loser = L)
+
+  edges <- results %>%
+    count(winner, loser, name = "wins") %>%
+    select(from = loser, to = winner, wins)
+
+  all_ids <- unique(c(edges$from, edges$to))
+  verts <- teams_df %>%
+    mutate(id = as.integer(id)) %>%
+    filter(id %in% all_ids) %>%
+    select(name = id)
+
+  if (nrow(edges) == 0) return(NULL)
+  graph_from_data_frame(edges, directed = TRUE, vertices = verts)
+}
+
+team_pal <- c(
+  ATL = "#E03A3E", BOS = "#007A33", BKN = "#000000", CHA = "#1D1160", CHI = "#CE1141",
+  CLE = "#860038", DAL = "#00538C", DEN = "#0E2240", DET = "#C8102E", GSW = "#1D428A",
+  HOU = "#CE1141", IND = "#cc9900", LAC = "#C8102E", LAL = "#ffd000", MEM = "#5D76A9",
+  MIA = "#98002E", MIL = "#00471B", MIN = "#0C2340", NOP = "#0C2340", NYK = "#ff821c",
+  OKC = "#007AC1", ORL = "#0077C0", PHI = "#006BB6", PHX = "#a53f00", POR = "#E03A3E",
+  SAC = "#5A2D81", SAS = "#C4CED4", TOR = "#CE1141", UTA = "#002B5C", WAS = "#002B5C"
+)
+
+PROC_DIR <- "data/processed"
+FIG_DIR <- "figures"
+dir.create(PROC_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load_data, cache=TRUE}
+DATA_DIR <- "data/raw"
+teams <- read_csv(file.path(DATA_DIR,"teams.csv"), show_col_types = FALSE)
+
+nba_ids <- teams %>%
+  filter(abbreviation %in% c(EAST_ABBR, WEST_ABBR)) %>%
+  mutate(id = as.integer(id)) %>%
+  pull(id)
+
+read_games <- function(s) read_csv(file.path(DATA_DIR,paste0("games_",s,".csv")),
+                                   show_col_types = FALSE)
+read_tgs <- function(s) read_csv(file.path(DATA_DIR,paste0("team_game_stats_",s,".csv")),
+                                   show_col_types = FALSE)
+
+games_all <- map(SEASONS, ~ filter_games(read_games(.x), nba_ids))
+names(games_all) <- SEASONS
+tgs_all <- map(SEASONS, ~ filter_tgs(read_tgs(.x), nba_ids))
+names(tgs_all) <- SEASONS
+```
+
+```{r build_all, cache=TRUE}
+
+all_sf <- map_dfr(SEASONS, ~ style_features(tgs_all[[.x]], teams))
+feat_global <- all_sf %>% select(pts, fg3a, fg3p, ast, tov, oreb, dreb, blk, stl) %>% as.matrix()
+global_center <- colMeans(feat_global, na.rm = TRUE)
+global_scale <- apply(feat_global, 2, sd, na.rm = TRUE)
+
+sf_focus <- map(FOCUS, ~ style_features(tgs_all[[.x]], teams))
+names(sf_focus) <- FOCUS
+sm_focus <- map(sf_focus, ~ cosine_sim_mat(.x, global_center, global_scale))
+sg_focus <- map(sm_focus, ~ build_style_graph(.x))
+
+style_density_ts <- map_dfr(SEASONS, function(s) {
+  sf <- style_features(tgs_all[[s]], teams)
+  sm <- cosine_sim_mat(sf, global_center, global_scale)
+  tibble(season=s,
+         mean_similarity = mean(sm[upper.tri(sm)], na.rm=TRUE),
+         avg_fg3a = mean(sf$fg3a, na.rm=TRUE),
+         avg_fg3p = mean(sf$fg3p, na.rm=TRUE))
+})
+write_csv(style_density_ts, file.path(PROC_DIR, "style_density_ts.csv"))
+
+.fg3a_start <- style_density_ts$avg_fg3a[match("2004-05", style_density_ts$season)]
+.fg3a_end <- style_density_ts$avg_fg3a[match("2024-25", style_density_ts$season)]
+fg3a_start <- formatC(.fg3a_start, format = "f", digits = 1) 
+fg3a_end <- formatC(.fg3a_end, format = "f", digits = 1)   
+fg3a_pct <- round(100 * (.fg3a_end - .fg3a_start) / .fg3a_start)
+sim_lo <- formatC(min(style_density_ts$mean_similarity, na.rm = TRUE), format = "f", digits = 2)
+sim_hi <- formatC(max(style_density_ts$mean_similarity, na.rm = TRUE), format = "f", digits = 2)
+
+set.seed(42)
+modularity_ts <- map_dfr(SEASONS, function(s) {
+  sf <- style_features(tgs_all[[s]], teams)
+  sm <- cosine_sim_mat(sf, global_center, global_scale)
+  g  <- build_style_graph(sm)
+  if (ecount(g) == 0)
+    return(tibble(season = s, mean_q = NA_real_, sd_q = NA_real_))
+  q_vals <- replicate(10, modularity(cluster_louvain(g, weights = E(g)$weight)))
+  tibble(season = s, mean_q = mean(q_vals), sd_q = sd(q_vals))
+})
+mod_sim_r <- round(cor(modularity_ts$mean_q,
+                       style_density_ts$mean_similarity,
+                       use = "complete.obs"), 3)
+write_csv(modularity_ts, file.path(PROC_DIR, "modularity_ts.csv"))
+
+comp_data <- map(SEASONS, function(s) {
+  g <- build_competition(games_all[[s]], teams)
+  if (is.null(g)) return(list(
+    ts = tibble(season=s, gini_pr=NA_real_, top1_pr=NA_real_),
+    detail = tibble()))
+  pr <- page_rank(g, directed=TRUE, weights=E(g)$wins)$vector
+  id2abbr <- teams %>% mutate(id=as.integer(id)) %>% select(id, abbreviation) %>% deframe()
+  win_pct <- games_all[[s]] %>%
+    mutate(tid = normalize_tid(TEAM_ID)) %>%
+    group_by(tid) %>%
+    summarize(win_pct = mean(WL == "W"), .groups="drop")
+  detail <- tibble(season=s, tid=as.integer(names(pr)), pr=as.numeric(pr)) %>%
+    mutate(abbreviation = id2abbr[as.character(tid)]) %>%
+    left_join(win_pct, by="tid")
+  list(
+    ts = tibble(season=s, gini_pr=Gini(pr, na.rm=TRUE), top1_pr=max(pr)),
+    detail = detail
+  )
+})
+comp_ts <- map_dfr(comp_data, "ts")
+comp_detail <- map_dfr(comp_data, "detail")
+write_csv(comp_ts, file.path(PROC_DIR, "comp_ts.csv"))
+write_csv(comp_detail, file.path(PROC_DIR, "comp_detail.csv"))
+
+pr_winpct_r <- round(cor(comp_detail$pr, comp_detail$win_pct, use = "complete.obs"), 3)
+
+pr_rank_div <- comp_detail %>%
+  filter(!is.na(pr), !is.na(win_pct)) %>%
+  group_by(season) %>%
+  mutate(pr_rank = rank(-pr, ties.method = "min"),
+         wp_rank = rank(-win_pct, ties.method = "min"),
+         div = wp_rank - pr_rank) %>%
+  ungroup() %>%
+  mutate(lab = paste0(abbreviation, " ", season,
+                      " (PR #", pr_rank, " vs W% #", wp_rank,
+                      ", ", ifelse(div > 0, "+", ""), div, ")"))
+pr_div_up_str <- pr_rank_div %>% slice_max(div, n = 2, with_ties = FALSE) %>% pull(lab) %>% paste(collapse = "; ")
+pr_div_down_str <- pr_rank_div %>% slice_min(div, n = 2, with_ties = FALSE) %>% pull(lab) %>% paste(collapse = "; ")
+write_csv(pr_rank_div, file.path(PROC_DIR, "pr_rank_div.csv"))
+
+f3 <- function(x) formatC(x, format = "f", digits = 3)
+gini_lo <- f3(min(comp_ts$gini_pr, na.rm=TRUE))
+gini_hi <- f3(max(comp_ts$gini_pr, na.rm=TRUE))
+gini_lo_season <- comp_ts$season[which.min(comp_ts$gini_pr)]
+gini_hi_season <- comp_ts$season[which.max(comp_ts$gini_pr)]
+top1_lo <- f3(min(comp_ts$top1_pr, na.rm=TRUE))
+top1_hi <- f3(max(comp_ts$top1_pr, na.rm=TRUE))
+```
+
+## Perchè l'NBA?
+
+**La domanda:** L'NBA è cambiata radicalmente negli ultimi 20 anni?
+
+Le statistiche tradizionali ci dicono *quanto bene* le squadre performano. L'analisi di rete ci aiuta invece a capire *come sono relazionate* tra loro le squadre:
+
+- **Chi ha uno stile di gioco simile** — La similarità del coseno delle statistiche di squadra per partita rivela se le franchigie convergono o divergono nello stile di gioco
+
+- **Chi batte chi** — Il grafo diretto di vittorie-sconfitte rivela la gerarchia di dominio e l'equilibrio competitivo al di là della semplice percentuale di vittorie, attraverso la transitività del PageRank
+
+> 21 stagioni regolari - 30 squadre NBA - ~1,230 partite a stagione intera
+
+
+## Domande di Ricerca
+
+
+**RQ1 — Somiglianza di stile di squadra**
+Negli ultimi 20 anni, l'NBA ha raggiunto uno stile di gioco omogeneo? Quando è iniziata questa convergenza e quali sono state le sue cause?
+
+**RQ2 — Dominio competitivo**
+Come si è evoluto l'equilibrio competitivo nel corso delle 21 stagioni? Il dominio di una squadra influenza direttamente la competitività della lega?
+
+## RQ1 — Costruzione della rete
+
+- **Vettore delle feature** per squadra per stagione (z-score globale attraverso tutte le feature):
+
+$$\mathbf{v}_i = [\text{PTS/g},\ \text{FG3A/g},\ \overline{\text{FG3\%}},\ \text{AST/g},\ \text{TOV/g},\ \text{OREB/g},\ \text{DREB/g},\ \text{BLK/g},\ \text{STL/g}]$$
+
+- **Similarità:** Similarità del coseno tra $\mathbf{v}_i$ e $\mathbf{v}_j$; arco viene disegnato sse la similarità ≥ 0.45
+
+- **Rilevamento delle comunità:** Louvain applicato sul grafo pesato (peso degli archi = similarità del coseno)
+
+>Le 9 feature sono medie per partita, che potremmo anche guardare una ad una. Usiamo la rete per due motivi: la similarità del coseno riassume tutte e 9 le statistiche in un solo valore di "vicinanza" tra due squadre, e Louvain ci dice se da quei valori emergono dei gruppi di squadre con stile simile. Ripetendo l'analisi sulle 21 stagioni vediamo se questi gruppi cambiano nel tempo.
+
+
+## RQ1 — Heatmaps di similarità
+
+```{r style_heatmap_pres, fig.height=13, fig.width=10, fig.align="center", cache=FALSE}
+plot_sim_heatmap <- function(sim_mat, season_label) {
+  abbr_order <- hclust(as.dist(1 - sim_mat))$order
+  ordered <- rownames(sim_mat)[abbr_order]
+  sim_long <- as.data.frame(sim_mat) %>%
+    rownames_to_column("team_x") %>%
+    pivot_longer(-team_x, names_to="team_y", values_to="sim") %>%
+    mutate(team_x = factor(team_x, levels=ordered),
+           team_y = factor(team_y, levels=ordered))
+  ggplot(sim_long, aes(x=team_x, y=team_y, fill=sim)) +
+    geom_tile(color="white", linewidth=0.3) +
+    scale_fill_gradient2(low="#1D3557", mid="white", high="#E63946",
+                         midpoint=0, limits=c(-1,1),
+                         oob=scales::squish,
+                         name="Similarità\ndel coseno") +
+    theme(axis.text.x=element_text(angle=90,hjust=1,size=6),
+          axis.text.y=element_text(size=6),
+          plot.title=element_text(size=11,face="bold"),
+          legend.key.height=unit(0.6,"cm")) +
+    labs(title=season_label, x=NULL, y=NULL)
+}
+fig_heatmap <- plot_sim_heatmap(sm_focus[["2004-05"]],"2004–05") /
+plot_sim_heatmap(sm_focus[["2014-15"]],"2014–15") /
+plot_sim_heatmap(sm_focus[["2024-25"]],"2024–25") +
+plot_annotation(title="Heatmap di similarità di stile",
+  subtitle="Clustering gerarchico; rosso = simili, blu = dissimili",
+  theme=theme(plot.title=element_text(size=13,face="bold"),
+              plot.subtitle=element_text(size=9,color="grey40")))
+ggsave(file.path(FIG_DIR, "01_heatmap_similarita.png"), fig_heatmap, width = 10, height = 13, dpi = 150)
+fig_heatmap
+```
+
+**Similarità media:**
+
+- *0,40* nel 2004-05
+- *0,09* nel 2014-15
+- *0,54* nel 2024-25
+
+## RQ1 — Reti di similarità di stile
+
+```{r style_network_pres, fig.height=13, fig.width=10, fig.align="center", cache=FALSE}
+plot_style_net <- function(g, season_label) {
+  if (is.null(g) || ecount(g) == 0)
+    return(ggplot() + ggtitle(season_label,"(nessun arco)") + theme_void())
+  tg <- as_tbl_graph(g) %>% activate(nodes) %>%
+    mutate(deg = centrality_degree(weights=weight))
+  set.seed(42)
+  ggraph(tg, layout="stress") +
+    geom_edge_link(aes(width=weight, alpha=weight), color="#5D6D7E",
+                   show.legend=FALSE) +
+    scale_edge_width(range=c(0.5,3)) +
+    scale_edge_alpha(range=c(0.3,0.9)) +
+    geom_node_point(aes(color=conference, size=deg+1), alpha=0.55) +
+    geom_node_text(aes(label=name), size=3, fontface="bold", repel=TRUE) +
+    scale_color_manual(values=CONF_COL, labels=c(East="Est", West="Ovest")) +
+    scale_size(range=c(3,10), guide="none") +
+    labs(title=season_label,
+         subtitle=paste0(vcount(g)," squadre, ",ecount(g)," coppie (sim cos ≥ 0.45), spessore = similarità"),
+         color="Conference") +
+    theme_graph(base_family="") +
+    theme(plot.title=element_text(size=11,face="bold"),
+          plot.subtitle=element_text(size=8,color="grey40"),
+          legend.position="bottom")
+}
+fig_network <- plot_style_net(sg_focus[["2004-05"]],"2004–05") /
+plot_style_net(sg_focus[["2014-15"]],"2014–15") /
+plot_style_net(sg_focus[["2024-25"]],"2024–25") +
+plot_layout(guides="collect") +
+plot_annotation(title="Reti di similarità di stile",
+  subtitle="Arco = similarità del coseno ≥ 0.45; dimensione nodo = grado; colore = Conference",
+  theme=theme(plot.title=element_text(size=13,face="bold"),
+              plot.subtitle=element_text(size=9,color="grey40"))) &
+theme(legend.position="bottom")
+ggsave(file.path(FIG_DIR, "02_reti_similarita.png"), fig_network, width = 10, height = 13, dpi = 150)
+fig_network
+```
+
+
+## RQ1 — La rivoluzione dei tre punti
+
+```{r style_temporal_pres, fig.height=8, fig.width=10, fig.align="center", cache=FALSE}
+p_3pa <- ggplot(style_density_ts, aes(x=season, y=avg_fg3a, group=1)) +
+  geom_line(color="#E63946", linewidth=0.9) +
+  geom_point(aes(color=season %in% FOCUS, size=season %in% FOCUS)) +
+  scale_color_manual(values=c("FALSE"="#E63946","TRUE"="#9B2226"), guide="none") +
+  scale_size_manual(values=c("FALSE"=1.5,"TRUE"=3.5), guide="none") +
+  theme_bw(base_size=10) +
+  theme(axis.text.x=element_text(angle=45,hjust=1,size=7),panel.grid.minor=element_blank()) +
+  labs(title="Media 3PA per partita", x=NULL, y="FG3A / partita")
+
+p_fg3pct <- ggplot(style_density_ts, aes(x=season, y=avg_fg3p, group=1)) +
+  geom_line(color="#F4A261", linewidth=0.9) +
+  geom_point(aes(color=season %in% FOCUS, size=season %in% FOCUS)) +
+  scale_color_manual(values=c("FALSE"="#F4A261","TRUE"="#C35A00"), guide="none") +
+  scale_size_manual(values=c("FALSE"=1.5,"TRUE"=3.5), guide="none") +
+  theme_bw(base_size=10) +
+  theme(axis.text.x=element_text(angle=45,hjust=1,size=7),panel.grid.minor=element_blank()) +
+  labs(title="Media 3PT% per partita", x=NULL, y="FG3%")
+
+fig_temporal <- p_3pa / p_fg3pct +
+  plot_annotation(title="La rivoluzione dei tre punti e la convergenza stilistica",
+    theme=theme(plot.title=element_text(size=12,face="bold")))
+ggsave(file.path(FIG_DIR, "03_rivoluzione_tre_punti.png"), fig_temporal, width = 10, height = 8, dpi = 150)
+fig_temporal
+```
+
+- **FG3A/partita:** +`r fg3a_pct`% — da `r fg3a_start` (2004–05) a `r fg3a_end` (2024–25)
+- **3PT%** è aumentato solo di ~3 punti percentuali: il volume è cresciuto molto più rapidamente dell'efficienza, segnalandola come scelta tattica piuttosto che come cambiamento nelle abilità dei giocatori.
+
+## RQ1 — Struttura delle comunità nel tempo
+
+```{r modularity_pres, fig.height=8, fig.width=10, fig.align="center", cache=FALSE}
+mod_plot_df <- modularity_ts %>%
+  left_join(style_density_ts %>% select(season, mean_similarity), by = "season") %>%
+  mutate(x = as.integer(factor(season, levels = SEASONS)),
+         is_focus = season %in% FOCUS)
+
+p_sim_mod <- ggplot(mod_plot_df, aes(x = x, y = mean_similarity)) +
+  geom_line(color = "#457B9D", linewidth = 0.9) +
+  geom_point(aes(size = is_focus, color = is_focus)) +
+  scale_color_manual(values = c("FALSE" = "#457B9D", "TRUE" = "#1D3557"), guide = "none") +
+  scale_size_manual(values = c("FALSE" = 1.5, "TRUE" = 3.5), guide = "none") +
+  scale_x_continuous(breaks = seq_along(SEASONS), labels = SEASONS) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "Similarità del coseno media a coppie", x = NULL, y = "Similarità media")
+
+p_mod <- ggplot(mod_plot_df, aes(x = x, y = mean_q)) +
+  geom_ribbon(aes(ymin = mean_q - sd_q, ymax = mean_q + sd_q),
+              fill = "#E63946", alpha = 0.18) +
+  geom_line(color = "#E63946", linewidth = 0.9) +
+  geom_point(aes(size = is_focus, color = is_focus)) +
+  scale_color_manual(values = c("FALSE" = "#E63946", "TRUE" = "#9B2226"), guide = "none") +
+  scale_size_manual(values = c("FALSE" = 1.5, "TRUE" = 3.5), guide = "none") +
+  scale_x_continuous(breaks = seq_along(SEASONS), labels = SEASONS) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        panel.grid.minor = element_blank()) +
+  labs(title = "Modularità Q — Louvain, pesata, 10 esecuzioni (banda ombreggiata = ±1 DS)", x = NULL, y = "Modularità Q")
+
+fig_modularity <- p_sim_mod / p_mod +
+  plot_annotation(
+    title = "Convergenza di stile vs struttura delle comunità",
+    theme = theme(plot.title = element_text(size = 12, face = "bold"))
+  )
+ggsave(file.path(FIG_DIR, "04_modularita_struttura.png"), fig_modularity, width = 10, height = 8, dpi = 150)
+fig_modularity
+```
+
+- **Modularità Q** Misura quanto fortemente il campionato si divide in comunità di stile distinte: Quando Q≈1: cluster chiari e ben separati (le squadre giocano in modo molto diverso da quelle al di fuori del loro gruppo); Quando Q≈0: nessuna struttura di comunità (tutte le squadre sono ugualmente connesse, lo stile è convergente)
+- **La similarità media e la modularità Q misurano concetti differenti**: La similarità media è un livello medio globale di peso degli archi (quanto sono simili le squadre in media); Q misura se tale similarità è concentrata all'interno delle comunità o distribuita uniformemente in tutta la lega.
+
+
+## RQ1 — Risultati principali
+
+- **Similarità per conference**: Inizialmente le squadre sembrano essere più simili all'interno delle conference di appartenenza che con il resto della rete, questa clusterizzazione va a perdersi con l'evoluzione dello stile di gioco
+- **La rivoluzione dei tre punti è inequivocabile**: i FG3A/partita sono cresciuti del ~`r fg3a_pct`% dal 2004–05 al 2024–25 (`r fg3a_start` → `r fg3a_end` tentativi/partita); il 3PT% è aumentato più modestamente (~3 pp), a indicare che il volume è cresciuto più velocemente dell'efficienza
+- **La convergenza stilistica segue un percorso non monotono**: la similarità ha un breve periodo stabile, poi cala fino al 2016 quando l'ondata del tiro da 3 guidata dall'analisi dei dati (con i Golden State come esempio più rappresentativo) divide le squadre tra "pionieri" e "ritardatari", per poi risalire quando il pace-and-space diventa universale dopo il 2017
+
+## RQ2 — Costruzione della rete
+
+- **Nodi:** 30 franchigie NBA 
+- **Archi (diretti):** Sconfitto → Vincitore, peso = numero di vittorie in stagione regolare
+- **PageRank**: Le squadre dominanti ricevono un PageRank alto perché sono "puntate" da squadre che a loro volta ne battono molte altre
+- **Coefficiente di Gini** della distribuzione del PageRank = misura quantitativa dello squilibrio competitivo
+
+>La percentuale di vittorie conta tutte le vittorie allo stesso modo, mentre il PageRank tiene conto di chi hai battuto; battere una squadra forte (che a sua volta batte altre squadre forti) vale più che battere una squadra debole, perchè il punteggio si propaga lungo gli archi del grafo. Così possiamo confrontare il "valore" delle vittorie di squadra con il suo record grezzo e vedere dove i due non coincidono
+
+
+## RQ2 — Cronologia delle dinastie
+
+```{r dynasty_timeline_pres, fig.height=8, fig.width=9, fig.align="center", cache=FALSE}
+dynasty_combined <- bind_rows(
+  comp_detail %>%
+    filter(!is.na(pr)) %>%
+    group_by(season) %>%
+    arrange(desc(pr)) %>%
+    mutate(rank = row_number()) %>%
+    filter(rank <= 5) %>%
+    ungroup() %>%
+    mutate(metric = "PageRank"),
+  comp_detail %>%
+    filter(!is.na(win_pct)) %>%
+    group_by(season) %>%
+    arrange(desc(win_pct)) %>%
+    mutate(rank = row_number()) %>%
+    filter(rank <= 5) %>%
+    ungroup() %>%
+    mutate(metric = "% Vittorie")
+) %>%
+  mutate(season = factor(season, levels=SEASONS),
+         rank = factor(rank),
+         metric = factor(metric, levels=c("PageRank","% Vittorie")))
+
+fig_dynasty <- ggplot(dynasty_combined, aes(x=season, y=rank, fill=abbreviation)) +
+  geom_tile(color="white", linewidth=0.8) +
+  geom_text(aes(label=abbreviation), size=2.5, fontface="bold", color="white") +
+  scale_fill_manual(values=team_pal, na.value="grey50") +
+  scale_y_discrete(limits=rev(as.character(1:5)),
+                   labels=c("1"="#1","2"="#2","3"="#3","4"="#4","5"="#5")) +
+  facet_wrap(~metric, ncol=1) +
+  theme_bw(base_size=11) +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=7),
+        legend.position = "none",
+        panel.grid = element_blank(),
+        strip.text = element_text(size=10, face="bold")) +
+  labs(title="Cronologia delle dinastie — Top-5 PageRank vs % Vittorie",
+       x=NULL, y="Posizione")
+ggsave(file.path(FIG_DIR, "05_cronologia_dinastie.png"), fig_dynasty, width = 10, height = 9, dpi = 150)
+fig_dynasty
+```
+
+## RQ2 — PageRank vs % Vittorie: dove divergono
+
+```{r competition_viz_pres, fig.height=6.5, fig.width=10, fig.align="center", cache=FALSE}
+div_lab <- bind_rows(
+  pr_rank_div %>% slice_max(div, n = 3, with_ties = FALSE),
+  pr_rank_div %>% slice_min(div, n = 3, with_ties = FALSE)
+) %>%
+  mutate(tag = paste0(abbreviation, " '", substr(season, 6, 7)))
+
+fig_divergence <- ggplot(pr_rank_div, aes(x = win_pct, y = pr)) +
+  geom_smooth(method = "lm", se = FALSE, color = "grey55",
+              linewidth = 0.7, linetype = "dashed") +
+  geom_point(aes(color = div), alpha = 0.65, size = 1.9) +
+  scale_color_gradient2(low = "#C8102E", mid = "grey80", high = "#1D9A6C",
+                        midpoint = 0, name = "Disaccordo\n(%Vitt − PR)") +
+  geom_point(data = div_lab, shape = 21, fill = NA, color = "black",
+             size = 3.4, stroke = 0.8) +
+  ggrepel::geom_text_repel(data = div_lab, aes(label = tag),
+                           size = 3.2, fontface = "bold",
+                           min.segment.length = 0, box.padding = 0.5, seed = 42) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "PageRank vs % Vittorie — 630 squadre-stagione",
+       subtitle = paste0("Correlazione forte (r = ", pr_winpct_r, ", r² ≈ ",
+                         round(pr_winpct_r^2, 2),
+                         "): i punti lontani dalla retta sono i disaccordi"),
+       x = "% Vittorie (stagione regolare)", y = "PageRank") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(size = 13, face = "bold"),
+        plot.subtitle = element_text(size = 10, color = "grey40"),
+        panel.grid.minor = element_blank())
+ggsave(file.path(FIG_DIR, "06_pagerank_vs_winpct.png"), fig_divergence, width = 10, height = 6.5, dpi = 150)
+fig_divergence
+```
+
+## RQ2 — Equilibrio competitivo nel tempo
+
+```{r competition_temporal_pres, fig.height=8, fig.width=9, fig.align="center", cache=FALSE}
+dynasty_rects <- tibble(
+  label = c("Era Heat", "Dinastia Warriors"),
+  xmin = c(which(SEASONS=="2011-12"), which(SEASONS=="2014-15")),
+  xmax = c(which(SEASONS=="2013-14"), which(SEASONS=="2018-19")),
+  ymin = -Inf, ymax = Inf
+)
+
+p_gini <- ggplot(comp_ts, aes(x=season, y=gini_pr, group=1)) +
+  geom_rect(data=dynasty_rects,
+            aes(xmin=xmin-0.5, xmax=xmax+0.5, ymin=ymin, ymax=ymax, fill=label),
+            inherit.aes=FALSE, alpha=0.10) +
+  scale_fill_manual(values=c("Era Heat"="#CE1141","Dinastia Warriors"="#1D62A4"),
+                    name=NULL) +
+  geom_line(color="#8338EC", linewidth=0.9) +
+  geom_point(aes(color=season %in% FOCUS, size=season %in% FOCUS)) +
+  scale_color_manual(values=c("FALSE"="#8338EC","TRUE"="#4A0E8F"), guide="none") +
+  scale_size_manual(values=c("FALSE"=1.5,"TRUE"=3.5), guide="none") +
+  geom_hline(yintercept=mean(comp_ts$gini_pr,na.rm=TRUE),
+             linetype="dashed", color="grey50") +
+  annotate("text", x=which(SEASONS=="2012-13")-0.2,
+           y=max(comp_ts$gini_pr,na.rm=TRUE)*0.96,
+           label="Era Heat", size=2.8, color="#CE1141", fontface="bold") +
+  annotate("text", x=which(SEASONS=="2016-17"),
+           y=max(comp_ts$gini_pr,na.rm=TRUE)*0.96,
+           label="Dinastia Warriors", size=2.8, color="#1D3D5C", fontface="bold") +
+  theme_bw(base_size=11) +
+  theme(axis.text.x=element_text(angle=45,hjust=1,size=8),
+        panel.grid.minor=element_blank(),
+        legend.position="none") +
+  labs(title="Coefficiente di Gini del PageRank (squilibrio competitivo)",
+       subtitle="Linea tratteggiata = Gini medio su 21 stagioni",
+       x=NULL, y="Coefficiente di Gini")
+
+p_top1 <- ggplot(comp_ts, aes(x=season, y=top1_pr, group=1)) +
+  geom_line(color="#F77F00", linewidth=0.9) +
+  geom_point(aes(color=season %in% FOCUS, size=season %in% FOCUS)) +
+  scale_color_manual(values=c("FALSE"="#F77F00","TRUE"="#C8102E"), guide="none") +
+  scale_size_manual(values=c("FALSE"=1.5,"TRUE"=3.5), guide="none") +
+  theme_bw(base_size=11) +
+  theme(axis.text.x=element_text(angle=45,hjust=1,size=8),
+        panel.grid.minor=element_blank()) +
+  labs(title="PageRank della squadra migliore (segnale di dinastia)",
+       x=NULL, y="PageRank massimo")
+
+fig_balance <- p_gini / p_top1 +
+  plot_annotation(title="Equilibrio competitivo",
+    theme=theme(plot.title=element_text(size=12,face="bold"),
+                plot.subtitle=element_text(size=9,color="grey40")))
+ggsave(file.path(FIG_DIR, "07_equilibrio_competitivo.png"), fig_balance, width = 10, height = 9, dpi = 150)
+fig_balance
+```
+
+
+## RQ2 — Risultati principali
+
+- **Nessun trend sistematico nello squilibrio**: il Gini oscilla tra `r gini_lo` e `r gini_hi` su 21 stagioni senza una chiara direzione di lungo periodo, l'equilibrio competitivo è stato costante nel tempo
+- **Una squadra dominante non implica un Gini massimo**: i Warriors campioni del 2015-16 (73 vittorie) sono ben al di sotto del massimo del 2007-08, più squadre d'élite (SAS, LAC, HOU) in competizione simultanea distribuiscono ampiamente il PageRank. Il minimo su 21 stagioni è `r gini_lo_season` (`r gini_lo`)
+- **`r gini_hi_season` è un outlier** (Gini `r gini_hi`): il formato ridotto e sbilanciato della bolla COVID gonfia la misura di disuguaglianza in modo anomalo
+- **Il PageRank segue da vicino la % di vittorie**: r = `r pr_winpct_r`, il contributo della difficoltà del calendario è reale ma per ora poco informativo, andrebbe analizzato assieme a come poi le squadre si comportano e a che risultati ottengono nei playoff
+- **Dove sono in disaccordo** (PageRank − % vittorie): il PageRank spinge **in alto** le squadre che battono avversari forti [`r pr_div_up_str`]; e **in basso** quelle che hanno gonfiato le vittorie contro squadre deboli [`r pr_div_down_str`]
+
+## Sintesi e limiti
+
+| Domanda di ricerca | Risultato principale |
+|---|---|
+| **RQ1** Similarità di stile | I tiri da 3 sono più che raddoppiati (+`r fg3a_pct`%, da `r fg3a_start` a `r fg3a_end` a partita) e le squadre hanno adottato uno stile sempre più simile, ma non in modo lineare: dopo una prima fase costante, la similarità diverge, con la divergenza massima tra il 2013 e il 2016, dalla stagione 2016-17 la rete ha incominciato a convergere sempre maggiormente |
+| **RQ2** Dominio competitivo | L'equilibrio competitivo oscilla nel tempo (Gini tra `r gini_lo` e `r gini_hi`), ma rimanendo comunque bilanciato. Una squadra dominante non rende il campionato più sbilanciato: i Warriors del 2015-16 restano sotto il picco del 2007-08. Il PageRank ricalca quasi del tutto la classifica (r = `r pr_winpct_r`), ma aggiunge la sensibilità alla forza del calendario. |
+
+
+**Limiti:**
+
+- Solo stagione regolare — dinamiche dei playoff escluse
+- Statistiche da box-score — nessuna metrica avanzata (True Shooting %, RAPTOR)
+- Le stagioni COVID (2019-20, 2020-21) e Lockout (2011-12) sono outlier strutturali (meno partite, calendario sbilanciato)
+
+**Direzioni future:** 
+
+- reti dei playoff 
+- attributi dei nodi a livello di giocatore (stipendio, età, ruolo) 
+- aumento del dataset aggiungendo stagioni
+
+
+## **Grazie per l'attenzione**
